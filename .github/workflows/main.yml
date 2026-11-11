@@ -1,0 +1,209 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write sources and build
+        run: |
+          set -e
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          BT=$(ls -d $SDK/build-tools/* | sort -V | tail -1)
+          AJ=$(ls $SDK/platforms/android-*/android.jar | sort -V | tail -1)
+          echo "Using $BT and $AJ"
+          mkdir -p obj
+
+          cat > AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.mini.player">
+            <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>
+            <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+            <uses-permission android:name="android.permission.WAKE_LOCK"/>
+            <application android:label="Mini Player" android:theme="@android:style/Theme.Material.NoActionBar">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+
+          cat > MainActivity.java <<'EOF'
+          package com.mini.player;
+
+          import android.app.Activity;
+          import android.database.Cursor;
+          import android.graphics.Color;
+          import android.media.MediaPlayer;
+          import android.net.Uri;
+          import android.os.*;
+          import android.provider.MediaStore;
+          import android.view.*;
+          import android.widget.*;
+          import java.util.*;
+
+          public class MainActivity extends Activity {
+            ArrayList<Long> ids = new ArrayList<>();
+            ArrayList<String> names = new ArrayList<>();
+            MediaPlayer mp;
+            int cur = -1;
+            boolean shuffle = false, seeking = false;
+            TextView title;
+            Button play, shuf;
+            SeekBar bar;
+            ListView list;
+            Handler h = new Handler(Looper.getMainLooper());
+            Runnable tick = new Runnable() {
+              public void run() {
+                if (mp != null && !seeking) {
+                  try { bar.setProgress(mp.getCurrentPosition()); } catch (Exception e) {}
+                }
+                h.postDelayed(this, 500);
+              }
+            };
+
+            Button btn(String t, LinearLayout row) {
+              Button b = new Button(this);
+              b.setText(t);
+              row.addView(b, new LinearLayout.LayoutParams(0, -2, 1));
+              return b;
+            }
+
+            protected void onCreate(Bundle s) {
+              super.onCreate(s);
+              LinearLayout root = new LinearLayout(this);
+              root.setOrientation(LinearLayout.VERTICAL);
+              root.setBackgroundColor(Color.rgb(18, 18, 18));
+              root.setPadding(0, 60, 0, 0);
+
+              list = new ListView(this);
+              root.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
+
+              title = new TextView(this);
+              title.setTextColor(Color.WHITE);
+              title.setTextSize(16);
+              title.setPadding(30, 20, 30, 0);
+              title.setText("Loading...");
+              root.addView(title);
+
+              bar = new SeekBar(this);
+              root.addView(bar);
+              bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                public void onProgressChanged(SeekBar b, int p, boolean user) {
+                  if (user && mp != null) mp.seekTo(p);
+                }
+                public void onStartTrackingTouch(SeekBar b) { seeking = true; }
+                public void onStopTrackingTouch(SeekBar b) { seeking = false; }
+              });
+
+              LinearLayout row = new LinearLayout(this);
+              Button prev = btn("Prev", row);
+              play = btn("Play", row);
+              Button next = btn("Next", row);
+              shuf = btn("Shuffle: off", row);
+              root.addView(row);
+              setContentView(root);
+
+              prev.setOnClickListener(v -> playAt(cur - 1));
+              next.setOnClickListener(v -> next());
+              play.setOnClickListener(v -> toggle());
+              shuf.setOnClickListener(v -> {
+                shuffle = !shuffle;
+                shuf.setText(shuffle ? "Shuffle: on" : "Shuffle: off");
+              });
+              list.setOnItemClickListener((p, v, i, id) -> playAt(i));
+
+              h.post(tick);
+              String perm = Build.VERSION.SDK_INT >= 33
+                  ? "android.permission.READ_MEDIA_AUDIO"
+                  : "android.permission.READ_EXTERNAL_STORAGE";
+              if (checkSelfPermission(perm) == 0) load();
+              else requestPermissions(new String[]{perm}, 1);
+            }
+
+            public void onRequestPermissionsResult(int c, String[] p, int[] r) {
+              if (r.length > 0 && r[0] == 0) load();
+              else title.setText("Permission needed to find your music");
+            }
+
+            void load() {
+              Cursor c = getContentResolver().query(
+                  MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                  new String[]{MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE},
+                  MediaStore.Audio.Media.DURATION + ">30000", null,
+                  MediaStore.Audio.Media.TITLE);
+              if (c != null) {
+                while (c.moveToNext()) {
+                  ids.add(c.getLong(0));
+                  names.add(c.getString(1));
+                }
+                c.close();
+              }
+              list.setAdapter(new ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, names) {
+                public View getView(int p, View v, ViewGroup g) {
+                  View r = super.getView(p, v, g);
+                  ((TextView) r).setTextColor(Color.WHITE);
+                  return r;
+                }
+              });
+              title.setText(names.size() + " songs");
+            }
+
+            void playAt(int i) {
+              if (ids.isEmpty()) return;
+              cur = (i + ids.size()) % ids.size();
+              try {
+                if (mp != null) mp.release();
+                mp = new MediaPlayer();
+                mp.setWakeMode(this, PowerManager.PARTIAL_WAKE_LOCK);
+                mp.setDataSource(this, Uri.withAppendedPath(
+                    MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, "" + ids.get(cur)));
+                mp.setOnCompletionListener(m -> next());
+                mp.prepare();
+                mp.start();
+                bar.setMax(mp.getDuration());
+                title.setText(names.get(cur));
+                play.setText("Pause");
+              } catch (Exception e) {
+                title.setText("Error: " + e.getMessage());
+              }
+            }
+
+            void next() {
+              playAt(shuffle ? new Random().nextInt(ids.size()) : cur + 1);
+            }
+
+            void toggle() {
+              if (mp == null) { playAt(0); return; }
+              if (mp.isPlaying()) { mp.pause(); play.setText("Play"); }
+              else { mp.start(); play.setText("Pause"); }
+            }
+
+            protected void onDestroy() {
+              super.onDestroy();
+              h.removeCallbacks(tick);
+              if (mp != null) mp.release();
+            }
+          }
+          EOF
+
+          $BT/aapt2 link -o base.apk -I $AJ --manifest AndroidManifest.xml --min-sdk-version 23 --target-sdk-version 34
+          javac --release 8 -cp $AJ -d obj MainActivity.java
+          $BT/d8 --release --min-api 23 --lib $AJ --output . $(find obj -name '*.class')
+          zip -j base.apk classes.dex
+          $BT/zipalign -f 4 base.apk aligned.apk
+          keytool -genkeypair -keystore k.jks -storepass android -keypass android -alias a -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=MiniPlayer"
+          $BT/apksigner sign --ks k.jks --ks-pass pass:android --out MiniPlayer.apk aligned.apk
+          ls -l MiniPlayer.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiniPlayer-apk
+          path: MiniPlayer.apk
